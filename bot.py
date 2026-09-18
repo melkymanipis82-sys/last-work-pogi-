@@ -88,16 +88,38 @@ def desktop_check(uid):
             out["text"] = text[:12000]
             ntext = norm(text)
 
-            for marker in DEAD_MARKERS:
-                if norm(marker) in ntext:
-                    out["matched_marker"] = marker
-                    out["status"] = "DEAD"
-                    break
+            # A real profile identity is a stronger signal than an incidental
+            # "content unavailable" phrase elsewhere on the rendered page.
+            # If Facebook exposes a non-empty profile name, treat the profile
+            # as LIVE unless the page is clearly a generic error/security page.
+            profile_name = ""
+            try:
+                og_title = page.locator('meta[property="og:title"]').get_attribute("content")
+                if og_title:
+                    profile_name = og_title.strip()
+            except Exception:
+                pass
 
-            if out["status"] == "UNKNOWN":
-                generic_error = any(x in ntext for x in GENERIC_ERRORS)
-                if "facebook" in norm(out["title"]) and len(ntext) > 150 and not generic_error:
-                    out["status"] = "LIVE"
+            if profile_name:
+                out["name"] = profile_name
+
+            generic_error = any(x in ntext for x in GENERIC_ERRORS)
+            has_facebook_title = "facebook" in norm(out["title"])
+            has_real_name = bool(out["name"].strip())
+
+            if has_real_name and not generic_error:
+                out["status"] = "LIVE"
+                out["matched_marker"] = None
+            else:
+                for marker in DEAD_MARKERS:
+                    if norm(marker) in ntext:
+                        out["matched_marker"] = marker
+                        out["status"] = "DEAD"
+                        break
+
+                if out["status"] == "UNKNOWN":
+                    if has_facebook_title and len(ntext) > 150 and not generic_error:
+                        out["status"] = "LIVE"
 
             try:
                 og = page.locator('meta[property="og:title"]').get_attribute("content")
@@ -288,7 +310,7 @@ def set_info(group, uid, raw):
 
 
 def help_text():
-    return """<b>FACEBOOK UID STATUS MONITOR</b>
+    return """<b>FACEBOOK UID STATUS MONITOR BY GARIC</b>
 
 <b>Monitoring</b>
 /addrecovery UID
@@ -306,10 +328,10 @@ Example:
 <code>/setinfo recovery 100070780590181 | Codilla Suspended Acc | 2500 | Karl | Recovery case; check appeal status</code>
 
 <b>Automatic checks</b>
-The bot checks every 5 minutes but <b>does NOT send a message every 5 minutes</b>.
+The bot checks every 5 minutes  </b>.
 It sends a notification only when a UID's detected status changes (LIVE ↔ DEAD/UNKNOWN).
 
-Detection uses the rendered Facebook page text as a signal; it is not a guaranteed enforcement-state determination."""
+Detection uses the api facebook  text as a signal; it is not a guaranteed enforcement-state determination."""
 
 
 def authorized(msg):
