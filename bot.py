@@ -8,6 +8,9 @@ from config import BOT_TOKEN, ALLOWED_CHAT_ID
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data", "saved_uids.json")
 LOCK = threading.Lock()
 SCAN_INTERVAL = 300
+# These are the messages shown by Facebook's desktop web page when a profile
+# cannot be viewed.  Keep matching case-insensitive because Facebook may vary
+# capitalization/whitespace between desktop responses.
 DEAD_MARKERS = [
     "this content isn't available right now",
     "this content is not available right now",
@@ -60,7 +63,7 @@ def normalize_uid(value):
 
 
 def desktop_check(uid):
-    url = f"https://www.facebook.com/profile.php?id={uid}"
+    url = f"https://web.facebook.com/profile.php?id={uid}"
     out = {
         "url": url, "http": None, "title": "", "text": "", "status": "UNKNOWN",
         "name": "", "picture_url": "", "matched_marker": None, "error": None,
@@ -96,15 +99,15 @@ def desktop_check(uid):
             out["title"] = html.unescape(re.sub(r"<[^>]+>", "", title_match.group(1))).strip()
 
         def meta_content(prop):
-            patterns = [
-                rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]+content=["\'](.*?)["\']',
-                rf'<meta[^>]+content=["\'](.*?)["\'][^>]+property=["\']{re.escape(prop)}["\']',
-                rf'<meta[^>]+name=["\']{re.escape(prop)}["\'][^>]+content=["\'](.*?)["\']',
-            ]
-            for pattern in patterns:
-                m = re.search(pattern, page_html, flags=re.I | re.S)
-                if m:
-                    return html.unescape(m.group(1)).strip()
+            # Facebook changes attribute order frequently. Parse each meta tag
+            # and inspect its attributes without relying on a fixed order.
+            for tag in re.findall(r"<meta\b[^>]*>", page_html, flags=re.I | re.S):
+                prop_m = re.search(r'\bproperty\s*=\s*["\']([^"\']+)["\']', tag, flags=re.I)
+                name_m = re.search(r'\bname\s*=\s*["\']([^"\']+)["\']', tag, flags=re.I)
+                content_m = re.search(r'\bcontent\s*=\s*["\'](.*?)["\']', tag, flags=re.I | re.S)
+                key = prop_m.group(1) if prop_m else (name_m.group(1) if name_m else "")
+                if key.lower() == prop.lower() and content_m:
+                    return html.unescape(content_m.group(1)).strip()
             return ""
 
         og_title = meta_content("og:title")
@@ -115,7 +118,43 @@ def desktop_check(uid):
         if og_image:
             out["picture_url"] = og_image
 
-        # Convert HTML to readable text for the same marker-based checks.
+        # Facebook may show the profile name in the HTML while a login
+        # overlay is displayed. In that case og:title can be absent.
+        name_candidates = []
+
+        def add_name(value):
+            value = html.unescape(value or "")
+            value = re.sub(r"\s+", " ", value).strip(" \t\r\n-–—|")
+            generic = {
+                "facebook", "log in", "login", "log into facebook",
+                "log in or sign up", "facebook - log in or sign up",
+            }
+            if value and len(value) <= 120 and value.lower() not in generic:
+                name_candidates.append(value)
+
+        identity_patterns = [
+            r"See more from\s+([^<|\n]+)",
+            r"\b(?:profile|page)\s+of\s+([^<|\n]+)",
+            r'"(?:full_name|name)"\s*:\s*"([^"]{2,120})"',
+            r'\b(?:aria-label|alt)\s*=\s*["\']([^"\']{2,120})["\']',
+            r'<h1[^>]*>\s*([^<]{2,120})\s*</h1>',
+        ]
+        for pattern in identity_patterns:
+            for match in re.finditer(pattern, page_html, flags=re.I | re.S):
+                add_name(match.group(1))
+                if len(name_candidates) >= 20:
+                    break
+
+        if not out["name"] and name_candidates:
+            for candidate in name_candidates:
+                if not any(x in candidate.lower() for x in (
+                    "facebook", "log in", "login", "password", "email",
+                    "create new account", "forgot",
+                )):
+                    out["name"] = candidate
+                    break
+
+        # Convert HTML to readable text for marker-based checks.
         text = re.sub(r"(?is)<(script|style|noscript|svg).*?>.*?</\1>", " ", page_html)
         text = re.sub(r"(?s)<[^>]+>", " ", text)
         text = html.unescape(text)
@@ -127,30 +166,41 @@ def desktop_check(uid):
         has_facebook_title = "facebook" in norm(out["title"])
         normalized_name = norm(out["name"])
 
-        # A real profile identity is stronger than an incidental
-        # "content unavailable" phrase. Avoid treating generic Facebook
-        # titles such as "Facebook" as a profile name.
+        # A non-generic profile identity is a positive LIVE signal.
         generic_names = {
             "facebook",
             "log into facebook",
             "log in to facebook",
             "facebook - log in or sign up",
+            "facebook login",
+            "facebook - log in",
         }
         has_real_name = bool(normalized_name) and normalized_name not in generic_names
 
-        if has_real_name and not generic_error:
+        # Explicit unavailable markers take priority. A login prompt alone
+        # does not mean the UID is dead.
+        explicit_dead = None
+        for marker in DEAD_MARKERS:
+            if norm(marker) in ntext:
+                explicit_dead = marker
+                break
+
+        # The desktop Facebook unavailable page is a definitive DEAD signal.
+        # It takes priority over any stale profile metadata that may still be
+        # embedded in the HTML.
+        if explicit_dead:
+            out["matched_marker"] = explicit_dead
+            out["status"] = "DEAD"
+        elif has_real_name and not generic_error:
             out["status"] = "LIVE"
             out["matched_marker"] = None
-        else:
-            for marker in DEAD_MARKERS:
-                if norm(marker) in ntext:
-                    out["matched_marker"] = marker
-                    out["status"] = "DEAD"
-                    break
-
-            if out["status"] == "UNKNOWN":
-                if has_facebook_title and len(ntext) > 150 and not generic_error:
-                    out["status"] = "LIVE"
+        elif has_real_name:
+            # Keep the positive identity signal even if Facebook also emits
+            # a generic temporary/login error string.
+            out["status"] = "LIVE"
+            out["matched_marker"] = None
+        elif has_facebook_title and len(ntext) > 150 and not generic_error:
+            out["status"] = "LIVE"
 
     except Exception as e:
         out["error"] = str(e)
@@ -234,7 +284,7 @@ def fmt_time(ts):
 
 def status_text(item, group, changed=False):
     label = status_label(item.get("status", "UNKNOWN"), group)
-    profile_url = f"https://www.facebook.com/profile.php?id={item['uid']}"
+    profile_url = f"https://web.facebook.com/profile.php?id={item['uid']}"
     lines = [f"<b>{label}</b>", f"📋 Issue: {esc(item.get('issue')) or '—'}", f'🔗 ID: <a href="{profile_url}"><code>{esc(item["uid"])}</code> - Link URL</a>']
     if item.get("name"):
         lines.append(f"👤 Profile: {esc(item['name'])}")
@@ -251,7 +301,7 @@ def status_text(item, group, changed=False):
 
 
 def buttons_for(item, group):
-    profile_url = f"https://www.facebook.com/profile.php?id={item['uid']}"
+    profile_url = f"https://web.facebook.com/profile.php?id={item['uid']}"
     return [[
         {"text": "📝 Update Info", "callback_data": f"edit|{group}|{item['uid']}"},
         {"text": "📊 List of UIDs", "callback_data": f"list|{group}"},
