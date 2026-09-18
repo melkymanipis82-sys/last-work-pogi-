@@ -1,14 +1,7 @@
-import os, re, json, time, threading, html, subprocess, importlib.util
+import os, re, json, time, threading, html
 from urllib.parse import urlparse, parse_qs
 import requests
 
-
-def ensure_package(import_name, pip_name):
-    if importlib.util.find_spec(import_name) is None:
-        subprocess.check_call(["python", "-m", "pip", "install", pip_name])
-
-ensure_package("playwright", "playwright>=1.50")
-from playwright.sync_api import sync_playwright
 
 from config import BOT_TOKEN, ALLOWED_CHAT_ID
 
@@ -72,70 +65,96 @@ def desktop_check(uid):
         "url": url, "http": None, "title": "", "text": "", "status": "UNKNOWN",
         "name": "", "picture_url": "", "matched_marker": None, "error": None,
     }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/138.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    }
+
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
-            page = browser.new_page(
-                viewport={"width": 1365, "height": 900},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36",
-                locale="en-US",
-            )
-            response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            out["http"] = response.status if response else None
-            page.wait_for_timeout(3500)
-            out["title"] = page.title()
-            text = page.locator("body").inner_text(timeout=10000)
-            out["text"] = text[:12000]
-            ntext = norm(text)
+        # Desktop-web check: no browser/Playwright is required.
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=30,
+            allow_redirects=True,
+        )
+        out["http"] = response.status
+        page_html = response.text or ""
 
-            # A real profile identity is a stronger signal than an incidental
-            # "content unavailable" phrase elsewhere on the rendered page.
-            # If Facebook exposes a non-empty profile name, treat the profile
-            # as LIVE unless the page is clearly a generic error/security page.
-            profile_name = ""
-            try:
-                og_title = page.locator('meta[property="og:title"]').get_attribute("content")
-                if og_title:
-                    profile_name = og_title.strip()
-            except Exception:
-                pass
+        # Extract the desktop page title and OpenGraph identity directly from HTML.
+        title_match = re.search(
+            r"<title[^>]*>(.*?)</title>",
+            page_html,
+            flags=re.I | re.S,
+        )
+        if title_match:
+            out["title"] = html.unescape(re.sub(r"<[^>]+>", "", title_match.group(1))).strip()
 
-            if profile_name:
-                out["name"] = profile_name
+        def meta_content(prop):
+            patterns = [
+                rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]+content=["\'](.*?)["\']',
+                rf'<meta[^>]+content=["\'](.*?)["\'][^>]+property=["\']{re.escape(prop)}["\']',
+                rf'<meta[^>]+name=["\']{re.escape(prop)}["\'][^>]+content=["\'](.*?)["\']',
+            ]
+            for pattern in patterns:
+                m = re.search(pattern, page_html, flags=re.I | re.S)
+                if m:
+                    return html.unescape(m.group(1)).strip()
+            return ""
 
-            generic_error = any(x in ntext for x in GENERIC_ERRORS)
-            has_facebook_title = "facebook" in norm(out["title"])
-            has_real_name = bool(out["name"].strip())
+        og_title = meta_content("og:title")
+        og_image = meta_content("og:image")
 
-            if has_real_name and not generic_error:
-                out["status"] = "LIVE"
-                out["matched_marker"] = None
-            else:
-                for marker in DEAD_MARKERS:
-                    if norm(marker) in ntext:
-                        out["matched_marker"] = marker
-                        out["status"] = "DEAD"
-                        break
+        if og_title:
+            out["name"] = og_title
+        if og_image:
+            out["picture_url"] = og_image
 
-                if out["status"] == "UNKNOWN":
-                    if has_facebook_title and len(ntext) > 150 and not generic_error:
-                        out["status"] = "LIVE"
+        # Convert HTML to readable text for the same marker-based checks.
+        text = re.sub(r"(?is)<(script|style|noscript|svg).*?>.*?</\1>", " ", page_html)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = html.unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        out["text"] = text[:12000]
+        ntext = norm(text)
 
-            try:
-                og = page.locator('meta[property="og:title"]').get_attribute("content")
-                if og:
-                    out["name"] = og.strip()
-            except Exception:
-                pass
-            try:
-                img = page.locator('meta[property="og:image"]').get_attribute("content")
-                if img:
-                    out["picture_url"] = img
-            except Exception:
-                pass
-            browser.close()
+        generic_error = any(x in ntext for x in GENERIC_ERRORS)
+        has_facebook_title = "facebook" in norm(out["title"])
+        normalized_name = norm(out["name"])
+
+        # A real profile identity is stronger than an incidental
+        # "content unavailable" phrase. Avoid treating generic Facebook
+        # titles such as "Facebook" as a profile name.
+        generic_names = {
+            "facebook",
+            "log into facebook",
+            "log in to facebook",
+            "facebook - log in or sign up",
+        }
+        has_real_name = bool(normalized_name) and normalized_name not in generic_names
+
+        if has_real_name and not generic_error:
+            out["status"] = "LIVE"
+            out["matched_marker"] = None
+        else:
+            for marker in DEAD_MARKERS:
+                if norm(marker) in ntext:
+                    out["matched_marker"] = marker
+                    out["status"] = "DEAD"
+                    break
+
+            if out["status"] == "UNKNOWN":
+                if has_facebook_title and len(ntext) > 150 and not generic_error:
+                    out["status"] = "LIVE"
+
     except Exception as e:
         out["error"] = str(e)
+
     return out
 
 
@@ -310,7 +329,7 @@ def set_info(group, uid, raw):
 
 
 def help_text():
-    return """<b>FACEBOOK UID STATUS MONITOR BY GARIC</b>
+    return """<b>FACEBOOK UID STATUS MONITOR</b>
 
 <b>Monitoring</b>
 /addrecovery UID
@@ -328,10 +347,10 @@ Example:
 <code>/setinfo recovery 100070780590181 | Codilla Suspended Acc | 2500 | Karl | Recovery case; check appeal status</code>
 
 <b>Automatic checks</b>
-The bot checks every 5 minutes  </b>.
+The bot checks every 5 minutes but <b>does NOT send a message every 5 minutes</b>.
 It sends a notification only when a UID's detected status changes (LIVE ↔ DEAD/UNKNOWN).
 
-Detection uses the api facebook  text as a signal; it is not a guaranteed enforcement-state determination."""
+Detection uses the rendered Facebook page text as a signal; it is not a guaranteed enforcement-state determination."""
 
 
 def authorized(msg):
@@ -470,22 +489,10 @@ def scheduler():
             print("[SCHEDULER ERROR]", e)
 
 
-def install_browser():
-    try:
-        with sync_playwright() as p:
-            try:
-                b = p.chromium.launch(headless=True)
-                b.close()
-            except Exception:
-                subprocess.check_call(["python", "-m", "playwright", "install", "chromium"])
-    except Exception as e:
-        print("[BROWSER SETUP FAILED]", e)
-
 
 if __name__ == "__main__":
     if not BOT_TOKEN or not ALLOWED_CHAT_ID:
         raise SystemExit("Set BOT_TOKEN and ALLOWED_CHAT_ID in config.py")
-    install_browser()
     threading.Thread(target=scheduler, daemon=True).start()
     print("Telegram UID Monitor running. Scheduled notifications are change-only.")
     poll()
